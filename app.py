@@ -35,6 +35,7 @@ CACHE_ARTIFACT_NAME = "search_artifacts.joblib"
 CACHE_REPORT_NAME = "index_report.json"
 DEFAULT_TOP_N = 20
 SEARCH_INDEX_VERSION = 4
+MANIFEST_CHECK_INTERVAL_MS = 30_000
 QUERY_HINT = "장애, 조치, 부서, 사용자, 날짜 등을 입력하세요"
 EXCLUDE_FILE_KEYWORDS = (
     "검색결과",
@@ -888,11 +889,12 @@ class MaintenanceSearchApp:
         self.utmp_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="인덱스를 불러오거나 새로 구축하세요.")
         self.index_notice_var = tk.StringVar(value="")
-        self._last_stale_warning_folder = ""
+        self._last_stale_warning_key = ""
 
         self._build_ui()
         self._show_query_hint()
         self._try_load_existing_index()
+        self._schedule_manifest_check()
 
     def _build_ui(self) -> None:
         style = ttk.Style()
@@ -1165,12 +1167,13 @@ class MaintenanceSearchApp:
         else:
             self.index_notice_var.set("")
             self.build_button.configure(text="인덱스 구축")
+            self._last_stale_warning_key = ""
 
     def _warn_stale_index_once(self, folder: Path) -> None:
-        folder_key = str(folder.resolve())
-        if self._last_stale_warning_folder == folder_key:
+        warning_key = f"{folder.resolve()}|{self.engine.index_stale_message}"
+        if self._last_stale_warning_key == warning_key:
             return
-        self._last_stale_warning_folder = folder_key
+        self._last_stale_warning_key = warning_key
         detail = f"\n\n변경 내용: {self.engine.index_stale_message}" if self.engine.index_stale_message else ""
         messagebox.showwarning(
             APP_TITLE,
@@ -1178,6 +1181,28 @@ class MaintenanceSearchApp:
             "[인덱스 구축]을 눌러 새로 구축해야 최신 검색 결과가 반영됩니다."
             f"{detail}",
         )
+
+    def _schedule_manifest_check(self) -> None:
+        self.root.after(MANIFEST_CHECK_INTERVAL_MS, self._check_source_files_changed)
+
+    def _check_source_files_changed(self) -> None:
+        try:
+            if not self._build_busy and self.engine.is_ready and self.engine.loaded_folder and self.engine.index_report:
+                folder = self.engine.loaded_folder
+                if folder.exists():
+                    stale, message = compare_source_file_manifest(folder, self.engine.index_report)
+                    self.engine.index_stale = stale
+                    self.engine.index_stale_message = message
+                    if stale:
+                        self._set_index_notice(True, message)
+                        self.status_var.set("데이터 변경 감지: 인덱스를 새로 구축하세요.")
+                        self._warn_stale_index_once(folder)
+                    else:
+                        self._set_index_notice(False)
+        except Exception:
+            pass
+        finally:
+            self._schedule_manifest_check()
 
     def _prepare_index(self) -> None:
         folder = Path(self.folder_var.get()).expanduser()
@@ -1246,6 +1271,7 @@ class MaintenanceSearchApp:
             self.year_values = years
             self.month_values = self._get_month_values()
             self._refresh_filter_combos()
+            self._last_stale_warning_key = ""
             self._set_index_notice(False)
             self.status_var.set(f"인덱스 구축 완료: {count}건 / 폴더: {folder}")
             messagebox.showinfo(APP_TITLE, self._format_build_summary(report))
