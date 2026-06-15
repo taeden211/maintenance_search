@@ -166,6 +166,70 @@ def get_excel_skip_reason(path: Path) -> str:
     return ""
 
 
+def build_source_file_manifest(folder: Path) -> list[dict[str, object]]:
+    manifest: list[dict[str, object]] = []
+    for path in sorted(folder.rglob("*.xlsx")):
+        if get_excel_skip_reason(path):
+            continue
+        try:
+            stat = path.stat()
+            relative_path = path.relative_to(folder).as_posix()
+        except OSError:
+            continue
+        manifest.append(
+            {
+                "path": relative_path,
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+    return manifest
+
+
+def normalize_manifest_entry(entry: object) -> Optional[tuple[str, int, int]]:
+    if not isinstance(entry, dict):
+        return None
+    path = str(entry.get("path", "")).replace("\\", "/")
+    if not path:
+        return None
+    try:
+        size = int(entry.get("size", 0))
+        mtime_ns = int(entry.get("mtime_ns", 0))
+    except (TypeError, ValueError):
+        return None
+    return path, size, mtime_ns
+
+
+def compare_source_file_manifest(folder: Path, report: dict[str, object]) -> tuple[bool, str]:
+    saved_manifest = report.get("file_manifest")
+    if not isinstance(saved_manifest, list):
+        return True, "이전 인덱스 형식입니다."
+
+    saved_entries = [entry for entry in (normalize_manifest_entry(item) for item in saved_manifest) if entry]
+    current_entries = [entry for entry in (normalize_manifest_entry(item) for item in build_source_file_manifest(folder)) if entry]
+    if sorted(saved_entries) == sorted(current_entries):
+        return False, ""
+
+    saved_by_path = {path: (size, mtime_ns) for path, size, mtime_ns in saved_entries}
+    current_by_path = {path: (size, mtime_ns) for path, size, mtime_ns in current_entries}
+    added = sorted(set(current_by_path) - set(saved_by_path))
+    removed = sorted(set(saved_by_path) - set(current_by_path))
+    changed = sorted(
+        path
+        for path in set(saved_by_path) & set(current_by_path)
+        if saved_by_path[path] != current_by_path[path]
+    )
+
+    parts: list[str] = []
+    if added:
+        parts.append(f"추가 {len(added)}개")
+    if removed:
+        parts.append(f"삭제 {len(removed)}개")
+    if changed:
+        parts.append(f"수정 {len(changed)}개")
+    return True, ", ".join(parts) if parts else "엑셀 파일 변경"
+
+
 def looks_like_maintenance_sheet(sheet: object) -> bool:
     texts: list[str] = []
     for row in sheet.iter_rows(min_row=1, max_row=8, max_col=10, values_only=True):
@@ -202,6 +266,7 @@ def create_empty_index_report() -> dict[str, object]:
         "sheet_details": [],
         "excluded_row_details": [],
         "quality_details": [],
+        "file_manifest": [],
     }
 
 
@@ -348,6 +413,9 @@ class MaintenanceRepository:
             return None
         return json.loads(self.report_path.read_text(encoding="utf-8"))
 
+    def compare_source_manifest(self, report: dict[str, object]) -> tuple[bool, str]:
+        return compare_source_file_manifest(self.folder, report)
+
 
 class MaintenanceSearchEngine:
     def __init__(self) -> None:
@@ -356,6 +424,8 @@ class MaintenanceSearchEngine:
         self.records: list[MaintenanceCase] = []
         self.loaded_folder: Optional[Path] = None
         self.index_report: Optional[dict[str, object]] = None
+        self.index_stale = False
+        self.index_stale_message = ""
 
     @property
     def is_ready(self) -> bool:
@@ -370,6 +440,7 @@ class MaintenanceSearchEngine:
         self.records = artifacts.records
         self.loaded_folder = folder
         self.index_report = self.repository.load_report() or self._legacy_report(len(self.records))
+        self.index_stale, self.index_stale_message = self.repository.compare_source_manifest(self.index_report)
         return True
 
     def build_from_folder(self, folder: Path) -> tuple[int, list[int], dict[str, object]]:
@@ -411,11 +482,14 @@ class MaintenanceSearchEngine:
         self.records = records
         self.loaded_folder = folder
         self.index_report = report
+        self.index_stale = False
+        self.index_stale_message = ""
         return len(records), years, report
 
     def _collect_cases(self, folder: Path) -> tuple[list[MaintenanceCase], dict[str, object]]:
         records: list[MaintenanceCase] = []
         report = create_empty_index_report()
+        report["file_manifest"] = build_source_file_manifest(folder)
         case_id = 1
 
         xlsx_paths = sorted(folder.rglob("*.xlsx"))
@@ -813,6 +887,8 @@ class MaintenanceSearchApp:
         self.pc_filter_var = tk.BooleanVar(value=False)
         self.utmp_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="인덱스를 불러오거나 새로 구축하세요.")
+        self.index_notice_var = tk.StringVar(value="")
+        self._last_stale_warning_folder = ""
 
         self._build_ui()
         self._show_query_hint()
@@ -835,6 +911,7 @@ class MaintenanceSearchApp:
         style.configure("Search.TEntry", foreground="#111111")
         style.configure("SearchHint.TEntry", foreground="#777777")
         style.configure("TLabelframe.Label", font=("맑은 고딕", 10, "bold"))
+        style.configure("Warning.TLabel", foreground="#B91C1C")
         style.configure("Treeview", rowheight=24)
         style.configure("Treeview.Heading", font=("맑은 고딕", 10, "bold"))
 
@@ -849,8 +926,12 @@ class MaintenanceSearchApp:
         folder_entry = ttk.Entry(top, textvariable=self.folder_var)
         folder_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
         ttk.Button(top, text="찾기", command=self._browse_folder).grid(row=0, column=2, padx=(0, 6))
-        ttk.Button(top, text="인덱스 구축", command=self._prepare_index).grid(row=0, column=3, padx=(0, 6))
+        self.build_button = ttk.Button(top, text="인덱스 구축", command=self._prepare_index)
+        self.build_button.grid(row=0, column=3, padx=(0, 6))
         ttk.Button(top, text="인덱스 리포트 보기", command=self._show_index_report).grid(row=0, column=4)
+        ttk.Label(top, textvariable=self.index_notice_var, style="Warning.TLabel").grid(
+            row=1, column=1, columnspan=4, sticky="w", padx=(8, 0), pady=(6, 0)
+        )
 
         search = ttk.LabelFrame(self.root, text="검색", padding=10)
         search.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
@@ -1076,6 +1157,28 @@ class MaintenanceSearchApp:
             self.query_var.set("")
             self.query_entry.configure(style="Search.TEntry")
 
+    def _set_index_notice(self, stale: bool, detail: str = "") -> None:
+        if stale:
+            suffix = f" ({detail})" if detail else ""
+            self.index_notice_var.set(f"데이터 변경 감지: [인덱스 구축]을 눌러 새로 구축하세요.{suffix}")
+            self.build_button.configure(text="인덱스 새로 구축")
+        else:
+            self.index_notice_var.set("")
+            self.build_button.configure(text="인덱스 구축")
+
+    def _warn_stale_index_once(self, folder: Path) -> None:
+        folder_key = str(folder.resolve())
+        if self._last_stale_warning_folder == folder_key:
+            return
+        self._last_stale_warning_folder = folder_key
+        detail = f"\n\n변경 내용: {self.engine.index_stale_message}" if self.engine.index_stale_message else ""
+        messagebox.showwarning(
+            APP_TITLE,
+            "데이터 폴더의 Excel 파일이 변경되었습니다.\n"
+            "[인덱스 구축]을 눌러 새로 구축해야 최신 검색 결과가 반영됩니다."
+            f"{detail}",
+        )
+
     def _prepare_index(self) -> None:
         folder = Path(self.folder_var.get()).expanduser()
         if not folder.exists():
@@ -1083,16 +1186,6 @@ class MaintenanceSearchApp:
             return
         if self._build_busy:
             return
-        try:
-            if self.engine.load_folder(folder):
-                self.year_values = self.engine.artifacts.years if self.engine.artifacts else []
-                self.month_values = self._get_month_values()
-                self._refresh_filter_combos()
-                self.status_var.set(f"저장된 인덱스 로드 완료: {len(self.engine.records)}건")
-                messagebox.showinfo(APP_TITLE, f"저장된 인덱스를 불러왔습니다.\n총 {len(self.engine.records)}건")
-                return
-        except Exception:
-            self.status_var.set("저장된 인덱스를 불러올 수 없어 새로 구축합니다.")
         self._start_build(folder)
 
     def _start_build(self, folder: Optional[Path] = None) -> None:
@@ -1117,14 +1210,22 @@ class MaintenanceSearchApp:
         folder = Path(self.folder_var.get()).expanduser()
         if not folder.exists():
             self.status_var.set("데이터 폴더가 없습니다.")
+            self._set_index_notice(False)
             return
         try:
             if self.engine.load_folder(folder):
                 self.year_values = self.engine.artifacts.years if self.engine.artifacts else []
                 self.month_values = self._get_month_values()
                 self._refresh_filter_combos()
-                self.status_var.set(f"인덱스 로드 완료: {len(self.engine.records)}건")
+                if self.engine.index_stale:
+                    self._set_index_notice(True, self.engine.index_stale_message)
+                    self.status_var.set("데이터 변경 감지: 인덱스를 새로 구축하세요.")
+                    self._warn_stale_index_once(folder)
+                else:
+                    self._set_index_notice(False)
+                    self.status_var.set(f"인덱스 로드 완료: {len(self.engine.records)}건")
             else:
+                self._set_index_notice(False)
                 self.status_var.set("저장된 인덱스가 없습니다. 인덱스 구축을 실행하세요.")
         except Exception as exc:
             messagebox.showerror(APP_TITLE, f"인덱스 로드 실패\n\n{exc}")
@@ -1145,6 +1246,7 @@ class MaintenanceSearchApp:
             self.year_values = years
             self.month_values = self._get_month_values()
             self._refresh_filter_combos()
+            self._set_index_notice(False)
             self.status_var.set(f"인덱스 구축 완료: {count}건 / 폴더: {folder}")
             messagebox.showinfo(APP_TITLE, self._format_build_summary(report))
         elif kind == "error":
@@ -1744,15 +1846,7 @@ class MaintenanceSearchApp:
         if is_list_mode:
             self.detail_score_var.set("관련도 -")
         else:
-            self.detail_score_var.set(
-                " · ".join(
-                    [
-                        f"관련도 {self._format_percent(result['score'])}",
-                        f"키워드 {self._format_percent(result['keyword_score'])}",
-                        f"유사도 {self._format_percent(result['similarity_score'])}",
-                    ]
-                )
-            )
+            self.detail_score_var.set(f"관련도 {self._format_percent(result['score'])}")
         self.detail_date_var.set(f"일자 {self._format_case_date(case)}")
         self.detail_person_var.set(f"부서 {case.department or '-'} · 사용자 {case.user or '-'}")
         self.detail_flags_var.set(
@@ -1796,10 +1890,7 @@ class MaintenanceSearchApp:
             headers = [
                 "순위",
                 "관련도",
-                "키워드 일치",
-                "내용 유사도",
                 "연도",
-                "월",
                 "날짜",
                 "부서",
                 "사용자",
@@ -1821,10 +1912,7 @@ class MaintenanceSearchApp:
                     [
                         result["rank"],
                         "-" if is_list_mode else self._format_percent(result["score"]),
-                        "-" if is_list_mode else self._format_percent(result["keyword_score"]),
-                        "-" if is_list_mode else self._format_percent(result["similarity_score"]),
                         case.year,
-                        case.month,
                         case.date_text,
                         case.department,
                         case.user,
@@ -1845,7 +1933,7 @@ class MaintenanceSearchApp:
                 cell.fill = header_fill
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
-            widths = [8, 12, 14, 14, 8, 8, 12, 18, 14, 42, 55, 9, 11, 9, 24, 16, 10]
+            widths = [8, 12, 8, 12, 18, 14, 42, 55, 9, 11, 9, 24, 16, 10]
             for index, width in enumerate(widths, start=1):
                 worksheet.column_dimensions[get_column_letter(index)].width = width
             for row in worksheet.iter_rows(min_row=2):
