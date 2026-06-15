@@ -5,6 +5,7 @@ import re
 import sqlite3
 import threading
 import traceback
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from queue import Empty, Queue
@@ -28,10 +29,21 @@ APP_TITLE = "유지보수 사례 검색기"
 CACHE_DIR_NAME = ".maintenance_search_cache"
 CACHE_DB_NAME = "maintenance_cases.sqlite"
 CACHE_ARTIFACT_NAME = "search_artifacts.joblib"
+CACHE_REPORT_NAME = "index_report.json"
 DEFAULT_TOP_N = 20
 DEFAULT_BM25_STAGE = 120
-SEARCH_INDEX_VERSION = 2
+SEARCH_INDEX_VERSION = 3
 QUERY_HINT = "검색할 장애 증상이나 조치 내용을 입력하세요"
+EXCLUDE_FILE_KEYWORDS = (
+    "검색결과",
+    "보고서",
+    "분석",
+    "result",
+    "output",
+    "backup",
+    "bak",
+)
+CHECKED_VALUES = {"O", "Y", "YES", "TRUE", "1", "○", "예"}
 
 
 @dataclass(slots=True)
@@ -70,6 +82,7 @@ class BM25Index:
         self.k1 = k1
         self.b = b
         self.tokenized_docs = tokenized_docs
+        self.term_freqs = [Counter(doc) for doc in tokenized_docs]
         self.doc_len = np.array([len(doc) for doc in tokenized_docs], dtype=np.float32)
         self.avgdl = float(self.doc_len.mean()) if len(self.doc_len) else 0.0
         self.doc_freq: dict[str, int] = {}
@@ -90,11 +103,8 @@ class BM25Index:
             if term not in self.idf:
                 continue
             idf = self.idf[term]
-            for idx, doc in enumerate(self.tokenized_docs):
-                tf = 0
-                for token in doc:
-                    if token == term:
-                        tf += 1
+            for idx, term_freq in enumerate(self.term_freqs):
+                tf = term_freq.get(term, 0)
                 if tf == 0:
                     continue
                 denom = tf + self.k1 * (1.0 - self.b + self.b * (self.doc_len[idx] / self.avgdl if self.avgdl else 0.0))
@@ -138,12 +148,64 @@ def safe_cell(value: object) -> str:
     return normalize_text(value)
 
 
+def is_checked(value: str) -> bool:
+    return normalize_text(value).strip().upper() in CHECKED_VALUES
+
+
+def get_excel_skip_reason(path: Path) -> str:
+    if path.name.startswith("~$"):
+        return "엑셀 임시 파일"
+    lowered = path.name.lower()
+    for keyword in EXCLUDE_FILE_KEYWORDS:
+        if keyword.lower() in lowered:
+            return f"제외 키워드 포함: {keyword}"
+    return ""
+
+
+def looks_like_maintenance_sheet(sheet: object) -> bool:
+    texts: list[str] = []
+    for row in sheet.iter_rows(min_row=1, max_row=8, max_col=10, values_only=True):
+        for value in row:
+            text = safe_cell(value).replace(" ", "")
+            if text:
+                texts.append(text)
+
+    has_issue = any("장애내용" in text or text == "장애" for text in texts)
+    has_action = any("조치내용" in text or "조치" in text for text in texts)
+    has_department = any("부서" in text for text in texts)
+    has_date = any("날짜" in text for text in texts)
+    return has_issue and has_action and (has_department or has_date)
+
+
+def create_empty_index_report() -> dict[str, object]:
+    return {
+        "total_files": 0,
+        "read_files": 0,
+        "excluded_files": 0,
+        "skipped_files": 0,
+        "total_rows": 0,
+        "valid_cases": 0,
+        "excluded_rows": 0,
+        "multi_sheet_files": 0,
+        "missing_departments": 0,
+        "missing_users": 0,
+        "missing_apc": 0,
+        "missing_pc_filter": 0,
+        "missing_utmp": 0,
+        "excluded_file_details": [],
+        "skipped_file_details": [],
+        "multi_sheet_details": [],
+        "sheet_details": [],
+    }
+
+
 class MaintenanceRepository:
     def __init__(self, folder: Path) -> None:
         self.folder = folder
         self.cache_dir = folder / CACHE_DIR_NAME
         self.db_path = self.cache_dir / CACHE_DB_NAME
         self.artifact_path = self.cache_dir / CACHE_ARTIFACT_NAME
+        self.report_path = self.cache_dir / CACHE_REPORT_NAME
 
     def ensure_cache_dir(self) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -154,6 +216,8 @@ class MaintenanceRepository:
             self.db_path.unlink()
         if self.artifact_path.exists():
             self.artifact_path.unlink()
+        if self.report_path.exists():
+            self.report_path.unlink()
 
     def save_records(self, records: list[MaintenanceCase]) -> None:
         self.ensure_cache_dir()
@@ -237,6 +301,15 @@ class MaintenanceRepository:
             years=payload["years"],
         )
 
+    def save_report(self, report: dict[str, object]) -> None:
+        self.ensure_cache_dir()
+        self.report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load_report(self) -> Optional[dict[str, object]]:
+        if not self.report_path.exists():
+            return None
+        return json.loads(self.report_path.read_text(encoding="utf-8"))
+
 
 class MaintenanceSearchEngine:
     def __init__(self) -> None:
@@ -244,6 +317,7 @@ class MaintenanceSearchEngine:
         self.artifacts: Optional[SearchArtifacts] = None
         self.records: list[MaintenanceCase] = []
         self.loaded_folder: Optional[Path] = None
+        self.index_report: Optional[dict[str, object]] = None
 
     @property
     def is_ready(self) -> bool:
@@ -257,12 +331,13 @@ class MaintenanceSearchEngine:
         self.artifacts = artifacts
         self.records = artifacts.records
         self.loaded_folder = folder
+        self.index_report = self.repository.load_report() or self._legacy_report(len(self.records))
         return True
 
-    def build_from_folder(self, folder: Path) -> tuple[int, list[int]]:
+    def build_from_folder(self, folder: Path) -> tuple[int, list[int], dict[str, object]]:
         repository = MaintenanceRepository(folder)
         repository.clear()
-        records = self._collect_cases(folder)
+        records, report = self._collect_cases(folder)
         if not records:
             raise RuntimeError("엑셀 파일에서 유효한 장애 사례를 찾지 못했습니다.")
 
@@ -291,84 +366,181 @@ class MaintenanceSearchEngine:
         )
         repository.save_records(records)
         repository.save_artifacts(artifacts)
+        report["valid_cases"] = len(records)
+        repository.save_report(report)
         self.repository = repository
         self.artifacts = artifacts
         self.records = records
         self.loaded_folder = folder
-        return len(records), years
+        self.index_report = report
+        return len(records), years, report
 
-    def _collect_cases(self, folder: Path) -> list[MaintenanceCase]:
+    def _collect_cases(self, folder: Path) -> tuple[list[MaintenanceCase], dict[str, object]]:
         records: list[MaintenanceCase] = []
+        report = create_empty_index_report()
         case_id = 1
 
-        for xlsx_path in sorted(folder.rglob("*.xlsx")):
-            if xlsx_path.name.startswith("~$"):
+        xlsx_paths = sorted(folder.rglob("*.xlsx"))
+        report["total_files"] = len(xlsx_paths)
+        for xlsx_path in xlsx_paths:
+            skip_reason = get_excel_skip_reason(xlsx_path)
+            if skip_reason:
+                report["excluded_files"] = int(report["excluded_files"]) + 1
+                report["excluded_file_details"].append({"file": xlsx_path.name, "reason": skip_reason})
                 continue
             year, month = parse_year_month_from_path(xlsx_path)
-            workbook = load_workbook(xlsx_path, data_only=True)
-            sheet = workbook[workbook.sheetnames[0]]
-            sheet_title = safe_cell(sheet.cell(1, 1).value)
-            source_sheet = safe_cell(sheet.title)
-            last_date = ""
+            try:
+                workbook = load_workbook(xlsx_path, data_only=True, read_only=True)
+            except Exception as exc:
+                report["skipped_files"] = int(report["skipped_files"]) + 1
+                report["skipped_file_details"].append({"file": xlsx_path.name, "reason": f"엑셀 로딩 실패: {exc}"})
+                continue
 
-            for row_num in range(5, sheet.max_row + 1):
-                row_values = [sheet.cell(row_num, col).value for col in range(1, 10)]
-                if not any(value not in (None, "") for value in row_values):
-                    continue
+            try:
+                sheet_names = workbook.sheetnames
+                read_sheet_count = 0
+                file_valid_cases = 0
 
-                seq = row_values[0]
-                date_value = safe_cell(row_values[1])
-                if date_value:
-                    last_date = date_value
-                date_text = date_value or last_date
-                department = safe_cell(row_values[2])
-                user = safe_cell(row_values[3])
-                issue_text = safe_cell(row_values[4])
-                action_text = safe_cell(row_values[5])
-                apc = safe_cell(row_values[6])
-                pc_filter = safe_cell(row_values[7])
-                utmp = safe_cell(row_values[8])
+                for sheet_name in sheet_names:
+                    sheet = workbook[sheet_name]
+                    if not looks_like_maintenance_sheet(sheet):
+                        report["sheet_details"].append(
+                            {
+                                "file": xlsx_path.name,
+                                "sheet": sheet_name,
+                                "status": "제외",
+                                "reason": "유지보수 양식으로 판단되지 않음",
+                                "rows": 0,
+                                "valid_cases": 0,
+                                "excluded_rows": 0,
+                            }
+                        )
+                        continue
 
-                if not any([issue_text, action_text, department, user, date_text, seq]):
-                    continue
+                    read_sheet_count += 1
+                    sheet_title = safe_cell(sheet.cell(1, 1).value)
+                    source_sheet = safe_cell(sheet.title)
+                    last_date = ""
+                    sheet_rows = 0
+                    sheet_valid_cases = 0
+                    sheet_excluded_rows = 0
 
-                searchable_text = " ".join(
-                    part
-                    for part in [
-                        issue_text,
-                        action_text,
-                        department,
-                        user,
-                        date_text,
-                        sheet_title,
-                        xlsx_path.stem,
-                    ]
-                    if part
-                )
+                    for row_num, row_values in enumerate(
+                        sheet.iter_rows(min_row=5, max_col=9, values_only=True),
+                        start=5,
+                    ):
+                        sheet_rows += 1
+                        report["total_rows"] = int(report["total_rows"]) + 1
+                        row_values = tuple(row_values) + (None,) * (9 - len(row_values))
 
-                records.append(
-                    MaintenanceCase(
-                        case_id=case_id,
-                        source_file=xlsx_path.name,
-                        source_sheet=source_sheet,
-                        row_num=row_num,
-                        year=year,
-                        month=month,
-                        date_text=date_text,
-                        department=department,
-                        user=user,
-                        issue_text=issue_text,
-                        action_text=action_text,
-                        apc=apc,
-                        pc_filter=pc_filter,
-                        utmp=utmp,
-                        sheet_title=sheet_title,
-                        search_text=searchable_text,
+                        seq = row_values[0]
+                        date_value = safe_cell(row_values[1])
+                        if date_value:
+                            last_date = date_value
+                        date_text = date_value or last_date
+                        department = safe_cell(row_values[2])
+                        user = safe_cell(row_values[3])
+                        issue_text = safe_cell(row_values[4])
+                        action_text = safe_cell(row_values[5])
+                        apc = safe_cell(row_values[6])
+                        pc_filter = safe_cell(row_values[7])
+                        utmp = safe_cell(row_values[8])
+
+                        if not issue_text and not action_text:
+                            sheet_excluded_rows += 1
+                            report["excluded_rows"] = int(report["excluded_rows"]) + 1
+                            continue
+
+                        if not department:
+                            report["missing_departments"] = int(report["missing_departments"]) + 1
+                        if not user:
+                            report["missing_users"] = int(report["missing_users"]) + 1
+                        if not apc:
+                            report["missing_apc"] = int(report["missing_apc"]) + 1
+                        if not pc_filter:
+                            report["missing_pc_filter"] = int(report["missing_pc_filter"]) + 1
+                        if not utmp:
+                            report["missing_utmp"] = int(report["missing_utmp"]) + 1
+
+                        searchable_text = " ".join(
+                            part
+                            for part in [
+                                issue_text,
+                                action_text,
+                                department,
+                                user,
+                                date_text,
+                                sheet_title,
+                                xlsx_path.stem,
+                            ]
+                            if part
+                        )
+
+                        records.append(
+                            MaintenanceCase(
+                                case_id=case_id,
+                                source_file=xlsx_path.name,
+                                source_sheet=source_sheet,
+                                row_num=row_num,
+                                year=year,
+                                month=month,
+                                date_text=date_text,
+                                department=department,
+                                user=user,
+                                issue_text=issue_text,
+                                action_text=action_text,
+                                apc=apc,
+                                pc_filter=pc_filter,
+                                utmp=utmp,
+                                sheet_title=sheet_title,
+                                search_text=searchable_text,
+                            )
+                        )
+                        case_id += 1
+                        sheet_valid_cases += 1
+                        file_valid_cases += 1
+
+                    report["sheet_details"].append(
+                        {
+                            "file": xlsx_path.name,
+                            "sheet": source_sheet,
+                            "status": "읽음",
+                            "reason": "",
+                            "rows": sheet_rows,
+                            "valid_cases": sheet_valid_cases,
+                            "excluded_rows": sheet_excluded_rows,
+                        }
                     )
-                )
-                case_id += 1
 
-        return records
+                if len(sheet_names) > 1:
+                    report["multi_sheet_files"] = int(report["multi_sheet_files"]) + 1
+                    report["multi_sheet_details"].append(
+                        {
+                            "file": xlsx_path.name,
+                            "total_sheets": len(sheet_names),
+                            "read_sheets": read_sheet_count,
+                            "note": "유지보수 양식 시트만 읽음" if read_sheet_count < len(sheet_names) else "전체 시트 읽음",
+                        }
+                    )
+
+                if read_sheet_count:
+                    report["read_files"] = int(report["read_files"]) + 1
+                else:
+                    report["skipped_files"] = int(report["skipped_files"]) + 1
+                    report["skipped_file_details"].append(
+                        {"file": xlsx_path.name, "reason": "유지보수 양식 시트 없음"}
+                    )
+            finally:
+                workbook.close()
+
+        report["valid_cases"] = len(records)
+        return records, report
+
+    @staticmethod
+    def _legacy_report(valid_cases: int) -> dict[str, object]:
+        report = create_empty_index_report()
+        report["valid_cases"] = valid_cases
+        return report
 
     def _apply_filters(self, filters: SearchFilters) -> list[int]:
         indices: list[int] = []
@@ -376,19 +548,21 @@ class MaintenanceSearchEngine:
         user_term = filters.user.strip().lower()
 
         for idx, record in enumerate(self.records):
-            if filters.year_from is not None and record.year and record.year < filters.year_from:
-                continue
-            if filters.year_to is not None and record.year and record.year > filters.year_to:
-                continue
+            if filters.year_from is not None:
+                if not record.year or record.year < filters.year_from:
+                    continue
+            if filters.year_to is not None:
+                if not record.year or record.year > filters.year_to:
+                    continue
             if department_term and department_term not in record.department.lower():
                 continue
             if user_term and user_term not in record.user.lower():
                 continue
-            if filters.require_apc and record.apc != "O":
+            if filters.require_apc and not is_checked(record.apc):
                 continue
-            if filters.require_pc_filter and record.pc_filter != "O":
+            if filters.require_pc_filter and not is_checked(record.pc_filter):
                 continue
-            if filters.require_utmp and record.utmp != "O":
+            if filters.require_utmp and not is_checked(record.utmp):
                 continue
             indices.append(idx)
         return indices
@@ -450,6 +624,8 @@ class MaintenanceSearchEngine:
         max_value = float(values.max())
         min_value = float(values.min())
         if np.isclose(max_value, min_value):
+            if max_value > 0:
+                return np.ones_like(values, dtype=np.float32)
             return np.zeros_like(values, dtype=np.float32)
         return ((values - min_value) / (max_value - min_value)).astype(np.float32)
 
@@ -499,13 +675,12 @@ class MaintenanceSearchApp:
         folder_entry = ttk.Entry(top, textvariable=self.folder_var)
         folder_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
         ttk.Button(top, text="찾기", command=self._browse_folder).grid(row=0, column=2, padx=(0, 6))
-        ttk.Button(top, text="인덱스 구축", command=self._start_build).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(top, text="인덱스 불러오기", command=self._load_index).grid(row=0, column=4)
+        ttk.Button(top, text="인덱스 구축", command=self._prepare_index).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(top, text="인덱스 리포트 보기", command=self._show_index_report).grid(row=0, column=4)
 
         search = ttk.LabelFrame(self.root, text="검색", padding=10)
         search.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
         search.columnconfigure(1, weight=1)
-        search.rowconfigure(2, weight=1)
 
         ttk.Label(search, text="장애내용 / 조치내용").grid(row=0, column=0, sticky="w")
         self.query_entry = ttk.Entry(search, textvariable=self.query_var, style="Search.TEntry")
@@ -628,8 +803,26 @@ class MaintenanceSearchApp:
             self.query_var.set("")
             self.query_entry.configure(style="Search.TEntry")
 
-    def _start_build(self) -> None:
+    def _prepare_index(self) -> None:
         folder = Path(self.folder_var.get()).expanduser()
+        if not folder.exists():
+            messagebox.showerror(APP_TITLE, "데이터 폴더를 찾을 수 없습니다.")
+            return
+        if self._build_busy:
+            return
+        try:
+            if self.engine.load_folder(folder):
+                self.year_values = self.engine.artifacts.years if self.engine.artifacts else []
+                self._refresh_year_combos()
+                self.status_var.set(f"저장된 인덱스 로드 완료: {len(self.engine.records)}건")
+                messagebox.showinfo(APP_TITLE, f"저장된 인덱스를 불러왔습니다.\n총 {len(self.engine.records)}건")
+                return
+        except Exception:
+            self.status_var.set("저장된 인덱스를 불러올 수 없어 새로 구축합니다.")
+        self._start_build(folder)
+
+    def _start_build(self, folder: Optional[Path] = None) -> None:
+        folder = folder or Path(self.folder_var.get()).expanduser()
         if not folder.exists():
             messagebox.showerror(APP_TITLE, "데이터 폴더를 찾을 수 없습니다.")
             return
@@ -641,8 +834,8 @@ class MaintenanceSearchApp:
 
     def _build_worker(self, folder: Path) -> None:
         try:
-            count, years = self.engine.build_from_folder(folder)
-            self.queue.put(("build_done", (count, years, folder)))
+            count, years, report = self.engine.build_from_folder(folder)
+            self.queue.put(("build_done", (count, years, folder, report)))
         except Exception as exc:
             self.queue.put(("error", (exc, traceback.format_exc())))
 
@@ -673,17 +866,135 @@ class MaintenanceSearchApp:
             return
 
         if kind == "build_done":
-            count, years, folder = payload
+            count, years, folder, report = payload
             self.year_values = years
             self._refresh_year_combos()
             self.status_var.set(f"인덱스 구축 완료: {count}건 / 폴더: {folder}")
-            messagebox.showinfo(APP_TITLE, f"인덱스 구축 완료\n총 {count}건의 사례를 저장했습니다.")
+            messagebox.showinfo(APP_TITLE, self._format_build_summary(report))
         elif kind == "error":
             exc, tb = payload
             messagebox.showerror(APP_TITLE, f"작업 중 오류가 발생했습니다.\n\n{exc}\n\n{tb}")
             self.status_var.set("오류가 발생했습니다.")
         self._build_busy = False
         self._set_busy(False)
+
+    def _format_build_summary(self, report: dict[str, object]) -> str:
+        return (
+            "인덱스 구축 완료\n"
+            f"읽은 파일: {report.get('read_files', 0)}개 / 전체 {report.get('total_files', 0)}개\n"
+            f"유효 사례: {report.get('valid_cases', 0)}건\n"
+            f"제외 행: {report.get('excluded_rows', 0)}건\n"
+            f"제외 파일: {report.get('excluded_files', 0)}개\n"
+            f"다중 시트 파일: {report.get('multi_sheet_files', 0)}개\n"
+            "자세한 내용은 [인덱스 리포트 보기]에서 확인하세요."
+        )
+
+    def _show_index_report(self) -> None:
+        report = self.engine.index_report
+        if report is None:
+            folder = Path(self.folder_var.get()).expanduser()
+            if folder.exists():
+                report = MaintenanceRepository(folder).load_report()
+                self.engine.index_report = report
+        if report is None:
+            messagebox.showwarning(APP_TITLE, "확인할 인덱스 리포트가 없습니다.")
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("인덱스 리포트")
+        window.geometry("780x520")
+        window.minsize(680, 440)
+
+        notebook = ttk.Notebook(window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        summary_rows = [
+            ("전체 파일", report.get("total_files", 0)),
+            ("읽은 파일", report.get("read_files", 0)),
+            ("제외 파일", report.get("excluded_files", 0)),
+            ("건너뛴 파일", report.get("skipped_files", 0)),
+            ("총 행 수", report.get("total_rows", 0)),
+            ("유효 사례", report.get("valid_cases", 0)),
+            ("제외 행", report.get("excluded_rows", 0)),
+            ("다중 시트 파일", report.get("multi_sheet_files", 0)),
+        ]
+        summary_frame = ttk.Frame(notebook, padding=8)
+        notebook.add(summary_frame, text="요약")
+        self._populate_tree(summary_frame, ("item", "value"), {"item": "항목", "value": "값"}, summary_rows)
+
+        excluded_rows = [
+            (item.get("file", ""), "제외", item.get("reason", ""))
+            for item in report.get("excluded_file_details", [])
+        ]
+        excluded_rows.extend(
+            (item.get("file", ""), "건너뜀", item.get("reason", ""))
+            for item in report.get("skipped_file_details", [])
+        )
+        excluded_frame = ttk.Frame(notebook, padding=8)
+        notebook.add(excluded_frame, text="제외 파일")
+        self._populate_tree(
+            excluded_frame,
+            ("file", "status", "reason"),
+            {"file": "파일명", "status": "구분", "reason": "사유"},
+            excluded_rows,
+        )
+
+        multi_sheet_rows = [
+            (
+                item.get("file", ""),
+                item.get("total_sheets", 0),
+                item.get("read_sheets", 0),
+                item.get("note", ""),
+            )
+            for item in report.get("multi_sheet_details", [])
+        ]
+        multi_frame = ttk.Frame(notebook, padding=8)
+        notebook.add(multi_frame, text="다중 시트")
+        self._populate_tree(
+            multi_frame,
+            ("file", "total", "read", "note"),
+            {"file": "파일명", "total": "전체 시트 수", "read": "읽은 시트 수", "note": "비고"},
+            multi_sheet_rows,
+        )
+
+        quality_rows = [
+            ("유효 사례", report.get("valid_cases", 0)),
+            ("제외 행", report.get("excluded_rows", 0)),
+            ("부서 누락", report.get("missing_departments", 0)),
+            ("사용자 누락", report.get("missing_users", 0)),
+            ("APC 누락", report.get("missing_apc", 0)),
+            ("PC filter 누락", report.get("missing_pc_filter", 0)),
+            ("UTMP 누락", report.get("missing_utmp", 0)),
+        ]
+        quality_frame = ttk.Frame(notebook, padding=8)
+        notebook.add(quality_frame, text="데이터 품질")
+        self._populate_tree(quality_frame, ("item", "value"), {"item": "항목", "value": "건수"}, quality_rows)
+
+    def _populate_tree(
+        self,
+        parent: ttk.Frame,
+        columns: tuple[str, ...],
+        headings: dict[str, str],
+        rows: list[tuple[object, ...]],
+    ) -> None:
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+        tree = ttk.Treeview(parent, columns=columns, show="headings")
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=180 if column == "file" else 120, anchor="w")
+        if rows:
+            for row in rows:
+                tree.insert("", tk.END, values=row)
+        else:
+            tree.insert("", tk.END, values=("표시할 내용 없음",) + ("",) * (len(columns) - 1))
+
+        vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tree.yview)
+        hsb = ttk.Scrollbar(parent, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
 
     def _set_busy(self, busy: bool) -> None:
         if busy:
@@ -837,6 +1148,7 @@ class MaintenanceSearchApp:
         try:
             from openpyxl import Workbook
             from openpyxl.styles import Alignment, Font, PatternFill
+            from openpyxl.utils import get_column_letter
 
             workbook = Workbook()
             worksheet = workbook.active
@@ -894,7 +1206,7 @@ class MaintenanceSearchApp:
 
             widths = [8, 12, 14, 14, 8, 8, 12, 18, 14, 42, 55, 9, 11, 9, 24, 16, 10]
             for index, width in enumerate(widths, start=1):
-                worksheet.column_dimensions[chr(64 + index)].width = width
+                worksheet.column_dimensions[get_column_letter(index)].width = width
             for row in worksheet.iter_rows(min_row=2):
                 for cell in row:
                     cell.alignment = Alignment(vertical="top", wrap_text=True)
