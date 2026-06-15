@@ -1703,15 +1703,75 @@ class MaintenanceSearchApp:
         month_var = tk.StringVar(value=initial_month)
         sequence_var = tk.StringVar(value=str(initial.get("sequence", "")))
         if month_values is not None:
-            ttk.Label(window, text="대상 월").grid(row=row, column=0, sticky="w", padx=12, pady=(12, 6))
-            month_combo = ttk.Combobox(window, textvariable=month_var, values=month_values, state="readonly", width=16)
-            month_combo.grid(
-                row=row, column=1, sticky="w", padx=12, pady=(12, 6)
+            months_by_year: dict[str, list[str]] = {}
+            for value in month_values:
+                try:
+                    year_text, month_text = value.split("-", 1)
+                except ValueError:
+                    continue
+                months_by_year.setdefault(year_text, []).append(month_text)
+            for months in months_by_year.values():
+                months.sort()
+
+            initial_year, initial_month_only = initial_month.split("-", 1)
+            year_var = tk.StringVar(value=initial_year)
+            month_only_var = tk.StringVar(value=initial_month_only)
+            target_file_var = tk.StringVar()
+
+            def update_target_file() -> None:
+                if not year_var.get() or not month_only_var.get():
+                    month_var.set("")
+                    target_file_var.set("저장 파일: -")
+                    return
+                selected_month = f"{year_var.get()}-{month_only_var.get()}"
+                month_var.set(selected_month)
+                sequence_var.set(self._get_next_sequence_for_month(selected_month))
+                path = self._find_workbook_for_month(selected_month)
+                if path is None:
+                    target_file_var.set("저장 파일: 해당 연월의 유지보수 엑셀 파일을 찾을 수 없습니다.")
+                else:
+                    base = Path(self.folder_var.get()).expanduser()
+                    try:
+                        display_path = path.relative_to(base)
+                    except ValueError:
+                        display_path = path
+                    target_file_var.set(f"저장 파일: {display_path}")
+
+            def update_month_choices() -> None:
+                values = months_by_year.get(year_var.get(), [])
+                month_combo.configure(values=values)
+                if month_only_var.get() not in values:
+                    month_only_var.set(values[-1] if values else "")
+                update_target_file()
+
+            ttk.Label(window, text="대상 연월").grid(row=row, column=0, sticky="w", padx=12, pady=(12, 6))
+            target_frame = ttk.Frame(window)
+            target_frame.grid(row=row, column=1, sticky="w", padx=12, pady=(12, 6))
+            year_combo = ttk.Combobox(
+                target_frame,
+                textvariable=year_var,
+                values=sorted(months_by_year),
+                state="readonly",
+                width=8,
             )
-            month_combo.bind(
-                "<<ComboboxSelected>>",
-                lambda _: sequence_var.set(self._get_next_sequence_for_month(month_var.get())),
+            year_combo.pack(side=tk.LEFT)
+            ttk.Label(target_frame, text="년").pack(side=tk.LEFT, padx=(4, 10))
+            month_combo = ttk.Combobox(target_frame, textvariable=month_only_var, state="readonly", width=6)
+            month_combo.pack(side=tk.LEFT)
+            ttk.Label(target_frame, text="월").pack(side=tk.LEFT, padx=(4, 0))
+            year_combo.bind("<<ComboboxSelected>>", lambda _: update_month_choices())
+            month_combo.bind("<<ComboboxSelected>>", lambda _: update_target_file())
+            row += 1
+
+            ttk.Label(window, text="저장 위치").grid(row=row, column=0, sticky="w", padx=12, pady=6)
+            target_file_label = ttk.Label(window, textvariable=target_file_var)
+            target_file_label.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+            target_file_label.bind(
+                "<Configure>",
+                lambda event: target_file_label.configure(wraplength=max(320, event.width - 8)),
+                add="+",
             )
+            update_month_choices()
             row += 1
         elif source_text:
             ttk.Label(window, text="원본").grid(row=row, column=0, sticky="w", padx=12, pady=(12, 6))
@@ -1876,6 +1936,7 @@ class MaintenanceSearchApp:
     def _copy_row_style(self, sheet: object, source_row: int, target_row: int) -> None:
         if source_row < 5:
             return
+        # 새 행이 기존 유지보수 양식과 같은 모양을 유지하도록 바로 윗행의 서식을 복사한다.
         for col in range(1, 10):
             source = sheet.cell(source_row, col)
             target = sheet.cell(target_row, col)
