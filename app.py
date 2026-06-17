@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import re
@@ -986,12 +987,12 @@ class MaintenanceSearchApp:
         self.year_to_combo.bind("<<ComboboxSelected>>", lambda _: self._normalize_filter_range("year_to"))
 
         ttk.Label(filter_frame, text="시작 월").grid(row=0, column=4, sticky="w")
-        self.month_from_combo = ttk.Combobox(filter_frame, textvariable=self.month_from_var, values=["전체"], width=9, state="readonly")
+        self.month_from_combo = ttk.Combobox(filter_frame, textvariable=self.month_from_var, values=["전체"], width=6, state="readonly")
         self.month_from_combo.grid(row=0, column=5, sticky="w", padx=(6, 12))
         self.month_from_combo.bind("<<ComboboxSelected>>", lambda _: self._normalize_filter_range("month_from"))
 
         ttk.Label(filter_frame, text="종료 월").grid(row=0, column=6, sticky="w")
-        self.month_to_combo = ttk.Combobox(filter_frame, textvariable=self.month_to_var, values=["전체"], width=9, state="readonly")
+        self.month_to_combo = ttk.Combobox(filter_frame, textvariable=self.month_to_var, values=["전체"], width=6, state="readonly")
         self.month_to_combo.grid(row=0, column=7, sticky="w", padx=(6, 0))
         self.month_to_combo.bind("<<ComboboxSelected>>", lambda _: self._normalize_filter_range("month_to"))
 
@@ -1011,14 +1012,17 @@ class MaintenanceSearchApp:
         ttk.Checkbutton(flags, text="PC filter", variable=self.pc_filter_var).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Checkbutton(flags, text="UTMP", variable=self.utmp_var).pack(side=tk.LEFT)
 
-        body = ttk.Panedwindow(self.root, orient=tk.VERTICAL)
+        body = ttk.Frame(self.root)
         body.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        body.rowconfigure(0, weight=1)
+        body.rowconfigure(1, weight=0, minsize=270)
+        body.columnconfigure(0, weight=1)
         self.root.rowconfigure(2, weight=1)
 
         results_frame = ttk.Labelframe(body, text="유사 사례 목록", padding=6)
         detail_frame = ttk.Labelframe(body, text="선택 항목 상세", padding=6)
-        body.add(results_frame, weight=3)
-        body.add(detail_frame, weight=2)
+        results_frame.grid(row=0, column=0, sticky="nsew")
+        detail_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
 
         results_frame.rowconfigure(0, weight=1)
         results_frame.columnconfigure(0, weight=1)
@@ -1693,8 +1697,8 @@ class MaintenanceSearchApp:
     ) -> None:
         window = tk.Toplevel(self.root)
         window.title(title)
-        window.geometry("620x560")
-        window.minsize(560, 500)
+        window.geometry("620x600")
+        window.minsize(560, 540)
         window.transient(self.root)
         window.grab_set()
         window.columnconfigure(1, weight=1)
@@ -1702,6 +1706,8 @@ class MaintenanceSearchApp:
 
         month_var = tk.StringVar(value=initial_month)
         sequence_var = tk.StringVar(value=str(initial.get("sequence", "")))
+        date_var = tk.StringVar(value=str(initial.get("date", "")))
+        day_var = tk.StringVar()
         if month_values is not None:
             months_by_year: dict[str, list[str]] = {}
             for value in month_values:
@@ -1717,6 +1723,39 @@ class MaintenanceSearchApp:
             year_var = tk.StringVar(value=initial_year)
             month_only_var = tk.StringVar(value=initial_month_only)
             target_file_var = tk.StringVar()
+            day_combo_holder: dict[str, ttk.Combobox] = {}
+
+            def parse_day(value: str) -> Optional[int]:
+                numbers = re.findall(r"\d+", value)
+                if not numbers:
+                    return None
+                day = int(numbers[-1])
+                return day if 1 <= day <= 31 else None
+
+            def update_date_from_day() -> None:
+                try:
+                    _, month_text = month_var.get().split("-", 1)
+                    month = int(month_text)
+                except ValueError:
+                    return
+                day = parse_day(day_var.get()) or 1
+                date_var.set(f"{month}월 {day}일")
+
+            def update_day_choices() -> None:
+                day_combo = day_combo_holder.get("combo")
+                if day_combo is None or not month_var.get():
+                    return
+                try:
+                    year_text, month_text = month_var.get().split("-", 1)
+                    last_day = calendar.monthrange(int(year_text), int(month_text))[1]
+                except ValueError:
+                    return
+                selected_day = parse_day(day_var.get()) or parse_day(date_var.get()) or 1
+                selected_day = max(1, min(selected_day, last_day))
+                day_values = [f"{day}일" for day in range(1, last_day + 1)]
+                day_combo.configure(values=day_values)
+                day_var.set(f"{selected_day}일")
+                update_date_from_day()
 
             def update_target_file() -> None:
                 if not year_var.get() or not month_only_var.get():
@@ -1726,6 +1765,7 @@ class MaintenanceSearchApp:
                 selected_month = f"{year_var.get()}-{month_only_var.get()}"
                 month_var.set(selected_month)
                 sequence_var.set(self._get_next_sequence_for_month(selected_month))
+                update_day_choices()
                 path = self._find_workbook_for_month(selected_month)
                 if path is None:
                     target_file_var.set("저장 파일: 해당 연월의 유지보수 엑셀 파일을 찾을 수 없습니다.")
@@ -1778,7 +1818,6 @@ class MaintenanceSearchApp:
             ttk.Label(window, text=source_text).grid(row=row, column=1, sticky="w", padx=12, pady=(12, 6))
             row += 1
 
-        date_var = tk.StringVar(value=str(initial.get("date", "")))
         department_var = tk.StringVar(value=str(initial.get("department", "")))
         user_var = tk.StringVar(value=str(initial.get("user", "")))
         apc_var = tk.BooleanVar(value=bool(initial.get("apc", False)))
@@ -1789,7 +1828,14 @@ class MaintenanceSearchApp:
         ttk.Entry(window, textvariable=sequence_var, width=12).grid(row=row, column=1, sticky="w", padx=12, pady=6)
         row += 1
         ttk.Label(window, text="날짜").grid(row=row, column=0, sticky="w", padx=12, pady=6)
-        ttk.Entry(window, textvariable=date_var).grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+        if month_values is not None:
+            day_combo = ttk.Combobox(window, textvariable=day_var, state="readonly", width=8)
+            day_combo.grid(row=row, column=1, sticky="w", padx=12, pady=6)
+            day_combo_holder["combo"] = day_combo
+            day_combo.bind("<<ComboboxSelected>>", lambda _: update_date_from_day())
+            update_day_choices()
+        else:
+            ttk.Entry(window, textvariable=date_var).grid(row=row, column=1, sticky="ew", padx=12, pady=6)
         row += 1
         ttk.Label(window, text="부서").grid(row=row, column=0, sticky="w", padx=12, pady=6)
         ttk.Entry(window, textvariable=department_var).grid(row=row, column=1, sticky="ew", padx=12, pady=6)
@@ -2089,40 +2135,67 @@ class MaintenanceSearchApp:
             }
         )
 
-    def _get_month_values_for_selected_years(self) -> list[str]:
-        if not self.month_values:
-            return []
+    @staticmethod
+    def _parse_filter_year(value: str) -> Optional[int]:
+        if not value or value == "전체":
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
 
-        def parse_year(value: str) -> Optional[int]:
-            if not value or value == "전체":
-                return None
-            try:
-                return int(value)
-            except ValueError:
-                return None
+    @staticmethod
+    def _parse_month_label(value: str) -> Optional[int]:
+        value = value.strip()
+        if not value or value == "전체":
+            return None
+        if "-" in value:
+            value = value.split("-", 1)[1]
+        value = value.replace("월", "").strip()
+        try:
+            month = int(value)
+        except ValueError:
+            return None
+        return month if 1 <= month <= 12 else None
 
-        start_year = parse_year(self.year_from_var.get())
-        end_year = parse_year(self.year_to_var.get())
+    @staticmethod
+    def _format_month_label(month: int) -> str:
+        return f"{month}월"
+
+    def _month_filter_year_bounds(self) -> tuple[Optional[int], Optional[int]]:
+        start_year = self._parse_filter_year(self.year_from_var.get())
+        end_year = self._parse_filter_year(self.year_to_var.get())
         if start_year is None and end_year is None:
-            return self.month_values
+            if self.year_values:
+                return min(self.year_values), max(self.year_values)
+            return None, None
         if start_year is None:
             start_year = end_year
         if end_year is None:
             end_year = start_year
-        if start_year is None or end_year is None:
-            return self.month_values
-        if start_year > end_year:
+        if start_year is not None and end_year is not None and start_year > end_year:
             start_year, end_year = end_year, start_year
+        return start_year, end_year
 
-        filtered: list[str] = []
+    def _get_month_values_for_selected_years(self) -> list[str]:
+        if not self.month_values:
+            return []
+
+        start_year, end_year = self._month_filter_year_bounds()
+        if start_year is None or end_year is None:
+            return []
+
+        months: set[int] = set()
         for value in self.month_values:
             try:
-                year = int(value.split("-", 1)[0])
+                year_text, month_text = value.split("-", 1)
+                year = int(year_text)
+                month = int(month_text)
             except ValueError:
                 continue
             if start_year <= year <= end_year:
-                filtered.append(value)
-        return filtered
+                months.add(month)
+        return [self._format_month_label(month) for month in sorted(months)]
 
     def _refresh_filter_combos(self) -> None:
         year_values = ["전체"] + [str(year) for year in self.year_values]
@@ -2190,7 +2263,11 @@ class MaintenanceSearchApp:
                 to_var.set(start)
                 finish()
                 return
-            if values.index(start) > values.index(end):
+            same_year_range = True
+            if not is_year:
+                start_year, end_year = self._month_filter_year_bounds()
+                same_year_range = start_year == end_year
+            if values.index(start) > values.index(end) and same_year_range:
                 to_var.set(start)
         else:
             if end == "전체":
@@ -2201,19 +2278,26 @@ class MaintenanceSearchApp:
                 from_var.set(end)
                 finish()
                 return
-            if values.index(start) > values.index(end):
+            same_year_range = True
+            if not is_year:
+                start_year, end_year = self._month_filter_year_bounds()
+                same_year_range = start_year == end_year
+            if values.index(start) > values.index(end) and same_year_range:
                 from_var.set(end)
         finish()
 
     def _collect_filters(self) -> SearchFilters:
-        def parse_year(value: str) -> Optional[int]:
-            value = value.strip()
-            if not value or value == "전체":
-                return None
-            try:
-                return int(value)
-            except ValueError:
-                return None
+        year_from = self._parse_filter_year(self.year_from_var.get())
+        year_to = self._parse_filter_year(self.year_to_var.get())
+        month_from_value = self._parse_month_label(self.month_from_var.get())
+        month_to_value = self._parse_month_label(self.month_to_var.get())
+        month_from = None
+        month_to = None
+        if month_from_value is not None or month_to_value is not None:
+            start_year, end_year = self._month_filter_year_bounds()
+            if start_year is not None and end_year is not None:
+                month_from = (start_year, month_from_value or 1)
+                month_to = (end_year, month_to_value or 12)
 
         def parse_month(value: str) -> Optional[tuple[int, int]]:
             value = value.strip()
@@ -2226,10 +2310,10 @@ class MaintenanceSearchApp:
                 return None
 
         return SearchFilters(
-            year_from=parse_year(self.year_from_var.get()),
-            year_to=parse_year(self.year_to_var.get()),
-            month_from=parse_month(self.month_from_var.get()),
-            month_to=parse_month(self.month_to_var.get()),
+            year_from=year_from,
+            year_to=year_to,
+            month_from=month_from,
+            month_to=month_to,
             department=self.department_var.get(),
             user=self.user_var.get(),
             require_apc=self.apc_var.get(),
