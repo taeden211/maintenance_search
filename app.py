@@ -4,6 +4,7 @@ import calendar
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import traceback
 from copy import copy
 from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import date, datetime
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable, Optional
@@ -1642,15 +1644,15 @@ class MaintenanceSearchApp:
         if not folder.exists():
             messagebox.showwarning(APP_TITLE, "먼저 데이터 폴더를 선택하세요.")
             return
-        month_values = self._get_available_source_months()
-        if not month_values:
+        source_month_values = self._get_available_source_months()
+        if not source_month_values:
             messagebox.showwarning(APP_TITLE, "유지보수 엑셀 파일을 찾을 수 없습니다.")
             return
-        initial_month = month_values[-1]
+        month_values = self._get_case_editor_month_values(source_month_values)
+        initial_month = source_month_values[-1]
         self._show_case_editor(
             title="새 내역 추가",
             initial={
-                "sequence": self._get_next_sequence_for_month(initial_month),
                 "date": "",
                 "department": "",
                 "user": "",
@@ -1672,7 +1674,6 @@ class MaintenanceSearchApp:
         self._show_case_editor(
             title="선택 항목 수정",
             initial={
-                "sequence": case.sequence_number,
                 "date": case.date_text,
                 "department": case.department,
                 "user": case.user,
@@ -1705,7 +1706,6 @@ class MaintenanceSearchApp:
         row = 0
 
         month_var = tk.StringVar(value=initial_month)
-        sequence_var = tk.StringVar(value=str(initial.get("sequence", "")))
         date_var = tk.StringVar(value=str(initial.get("date", "")))
         day_var = tk.StringVar()
         if month_values is not None:
@@ -1724,6 +1724,7 @@ class MaintenanceSearchApp:
             month_only_var = tk.StringVar(value=initial_month_only)
             target_file_var = tk.StringVar()
             day_combo_holder: dict[str, ttk.Combobox] = {}
+            create_file_button_holder: dict[str, ttk.Button] = {}
 
             def parse_day(value: str) -> Optional[int]:
                 numbers = re.findall(r"\d+", value)
@@ -1760,22 +1761,39 @@ class MaintenanceSearchApp:
             def update_target_file() -> None:
                 if not year_var.get() or not month_only_var.get():
                     month_var.set("")
-                    target_file_var.set("저장 파일: -")
+                    target_file_var.set("-")
+                    button = create_file_button_holder.get("button")
+                    if button is not None:
+                        button.state(["disabled"])
                     return
                 selected_month = f"{year_var.get()}-{month_only_var.get()}"
                 month_var.set(selected_month)
-                sequence_var.set(self._get_next_sequence_for_month(selected_month))
                 update_day_choices()
                 path = self._find_workbook_for_month(selected_month)
+                button = create_file_button_holder.get("button")
                 if path is None:
-                    target_file_var.set("저장 파일: 해당 연월의 유지보수 엑셀 파일을 찾을 수 없습니다.")
+                    suggested_path = self._suggest_workbook_path_for_month(selected_month)
+                    target_file_var.set(f"새 파일 생성 예정: {self._display_data_path(suggested_path)}")
+                    if button is not None:
+                        button.state(["!disabled"])
                 else:
-                    base = Path(self.folder_var.get()).expanduser()
-                    try:
-                        display_path = path.relative_to(base)
-                    except ValueError:
-                        display_path = path
-                    target_file_var.set(f"저장 파일: {display_path}")
+                    target_file_var.set(f"기존 파일: {self._display_data_path(path)}")
+                    if button is not None:
+                        button.state(["disabled"])
+
+            def create_month_file() -> None:
+                selected_month = month_var.get()
+                if not selected_month:
+                    return
+                try:
+                    path = self._ensure_workbook_for_month(selected_month)
+                except Exception as exc:
+                    messagebox.showerror(APP_TITLE, f"새 월 파일 생성 실패\n\n{exc}", parent=window)
+                    return
+                target_file_var.set(f"새 파일 생성 완료: {self._display_data_path(path)}")
+                button = create_file_button_holder.get("button")
+                if button is not None:
+                    button.state(["disabled"])
 
             def update_month_choices() -> None:
                 values = months_by_year.get(year_var.get(), [])
@@ -1803,9 +1821,15 @@ class MaintenanceSearchApp:
             month_combo.bind("<<ComboboxSelected>>", lambda _: update_target_file())
             row += 1
 
-            ttk.Label(window, text="저장 위치").grid(row=row, column=0, sticky="w", padx=12, pady=6)
-            target_file_label = ttk.Label(window, textvariable=target_file_var)
-            target_file_label.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+            ttk.Label(window, text="파일").grid(row=row, column=0, sticky="w", padx=12, pady=6)
+            file_frame = ttk.Frame(window)
+            file_frame.grid(row=row, column=1, sticky="ew", padx=12, pady=6)
+            file_frame.columnconfigure(0, weight=1)
+            target_file_label = ttk.Label(file_frame, textvariable=target_file_var)
+            target_file_label.grid(row=0, column=0, sticky="ew")
+            create_file_button = ttk.Button(file_frame, text="새 월 파일 만들기", command=create_month_file)
+            create_file_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
+            create_file_button_holder["button"] = create_file_button
             target_file_label.bind(
                 "<Configure>",
                 lambda event: target_file_label.configure(wraplength=max(320, event.width - 8)),
@@ -1824,9 +1848,6 @@ class MaintenanceSearchApp:
         pc_filter_var = tk.BooleanVar(value=bool(initial.get("pc_filter", False)))
         utmp_var = tk.BooleanVar(value=bool(initial.get("utmp", False)))
 
-        ttk.Label(window, text="순번").grid(row=row, column=0, sticky="w", padx=12, pady=6)
-        ttk.Entry(window, textvariable=sequence_var, width=12).grid(row=row, column=1, sticky="w", padx=12, pady=6)
-        row += 1
         ttk.Label(window, text="날짜").grid(row=row, column=0, sticky="w", padx=12, pady=6)
         if month_values is not None:
             day_combo = ttk.Combobox(window, textvariable=day_var, state="readonly", width=8)
@@ -1867,7 +1888,6 @@ class MaintenanceSearchApp:
 
         def save() -> None:
             values = {
-                "sequence": sequence_var.get().strip(),
                 "date": date_var.get().strip(),
                 "department": department_var.get().strip(),
                 "user": user_var.get().strip(),
@@ -1880,12 +1900,6 @@ class MaintenanceSearchApp:
             if month_values is not None and not month_var.get():
                 messagebox.showwarning(APP_TITLE, "대상 월을 선택하세요.", parent=window)
                 return
-            if not values["sequence"]:
-                messagebox.showwarning(APP_TITLE, "순번을 입력하세요.", parent=window)
-                return
-            if not values["sequence"].isdigit():
-                messagebox.showwarning(APP_TITLE, "순번은 숫자로 입력하세요.", parent=window)
-                return
             if month_values is not None and not values["date"]:
                 messagebox.showwarning(APP_TITLE, "날짜를 입력하세요.", parent=window)
                 return
@@ -1895,6 +1909,13 @@ class MaintenanceSearchApp:
             if not values["issue"] and not values["action"]:
                 messagebox.showwarning(APP_TITLE, "장애내용 또는 조치내용을 입력하세요.", parent=window)
                 return
+            if month_values is not None and self._find_workbook_for_month(month_var.get()) is None:
+                if not messagebox.askyesno(
+                    APP_TITLE,
+                    "선택한 월의 Excel 파일이 없습니다.\n새 월 파일을 만든 뒤 저장할까요?",
+                    parent=window,
+                ):
+                    return
             try:
                 saved_path, success_message = on_save(values, month_var.get())
             except PermissionError:
@@ -1915,7 +1936,7 @@ class MaintenanceSearchApp:
         ttk.Button(buttons, text="저장", command=save).pack(side=tk.LEFT)
         ttk.Button(buttons, text="취소", command=window.destroy).pack(side=tk.LEFT, padx=(6, 0))
 
-    # 새 내역 추가 시 대상 월 파일의 마지막 순번을 기준으로 다음 번호를 제안한다.
+    # 새 내역 추가 창에서 기존 월과 새로 만들 수 있는 월을 함께 보여준다.
     def _get_available_source_months(self) -> list[str]:
         folder = Path(self.folder_var.get()).expanduser()
         if not folder.exists():
@@ -1929,11 +1950,38 @@ class MaintenanceSearchApp:
                 months.add(f"{year}-{month:02d}")
         return sorted(months)
 
-    def _find_workbook_for_month(self, month_text: str) -> Optional[Path]:
+    def _display_data_path(self, path: Path) -> str:
+        base = Path(self.folder_var.get()).expanduser()
+        try:
+            return str(path.relative_to(base))
+        except ValueError:
+            return str(path)
+
+    @staticmethod
+    def _parse_year_month_text(month_text: str) -> Optional[tuple[int, int]]:
         try:
             year_text, month_part = month_text.split("-", 1)
-            target = (int(year_text), int(month_part))
+            year = int(year_text)
+            month = int(month_part)
         except ValueError:
+            return None
+        if 1 <= month <= 12:
+            return year, month
+        return None
+
+    def _get_case_editor_month_values(self, existing_month_values: list[str]) -> list[str]:
+        parsed = [value for value in (self._parse_year_month_text(item) for item in existing_month_values) if value]
+        if not parsed:
+            return []
+        years = {year for year, _month in parsed}
+        latest_year, latest_month = max(parsed)
+        if latest_month == 12:
+            years.add(latest_year + 1)
+        return [f"{year}-{month:02d}" for year in sorted(years) for month in range(1, 13)]
+
+    def _find_workbook_for_month(self, month_text: str) -> Optional[Path]:
+        target = self._parse_year_month_text(month_text)
+        if target is None:
             return None
         folder = Path(self.folder_var.get()).expanduser()
         matches: list[Path] = []
@@ -1944,16 +1992,66 @@ class MaintenanceSearchApp:
                 matches.append(path)
         return matches[0] if matches else None
 
-    def _get_next_sequence_for_month(self, month_text: str) -> str:
-        path = self._find_workbook_for_month(month_text)
-        if path is None:
-            return ""
-        workbook = load_workbook(path, read_only=True, data_only=True)
+    def _suggest_workbook_path_for_month(self, month_text: str) -> Path:
+        parsed = self._parse_year_month_text(month_text)
+        if parsed is None:
+            return Path(self.folder_var.get()).expanduser()
+        year, month = parsed
+        folder = Path(self.folder_var.get()).expanduser()
+        for path in sorted(folder.rglob("*.xlsx")):
+            if get_excel_skip_reason(path):
+                continue
+            if parse_year_month_from_path(path)[0] == year:
+                return path.parent / f"{year}{month:02d}유지보수내역서.xlsx"
+        parent = folder if folder.name == str(year) else folder / str(year)
+        return parent / f"{year}{month:02d}유지보수내역서.xlsx"
+
+    def _find_template_workbook_for_month(self, month_text: str) -> Optional[Path]:
+        target = self._parse_year_month_text(month_text)
+        folder = Path(self.folder_var.get()).expanduser()
+        candidates: list[tuple[int, Path]] = []
+        for path in sorted(folder.rglob("*.xlsx")):
+            if get_excel_skip_reason(path):
+                continue
+            parsed = parse_year_month_from_path(path)
+            if not parsed[0] or not parsed[1]:
+                continue
+            distance = abs((parsed[0] * 12 + parsed[1]) - (target[0] * 12 + target[1])) if target else 0
+            before_bonus = 0 if target and (parsed[0], parsed[1]) <= target else 10_000
+            candidates.append((before_bonus + distance, path))
+        return min(candidates, default=(0, None), key=lambda item: item[0])[1]
+
+    def _create_workbook_for_month(self, month_text: str) -> Path:
+        parsed = self._parse_year_month_text(month_text)
+        if parsed is None:
+            raise RuntimeError("대상 연월이 올바르지 않습니다.")
+        year, month = parsed
+        target_path = self._suggest_workbook_path_for_month(month_text)
+        if target_path.exists():
+            return target_path
+        template_path = self._find_template_workbook_for_month(month_text)
+        if template_path is None:
+            raise RuntimeError("새 파일을 만들 기준 유지보수 양식 파일을 찾을 수 없습니다.")
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(template_path, target_path)
+        workbook = load_workbook(target_path, keep_links=False)
         try:
             sheet = self._find_maintenance_sheet(workbook)
-            return str(self._next_sequence_number(sheet))
+            sheet.cell(1, 1).value = f"{month}월  전산장비 장애 처리 내역"
+            for row in range(5, sheet.max_row + 1):
+                for col in range(1, 10):
+                    sheet.cell(row, col).value = None
+            workbook.save(target_path)
         finally:
             workbook.close()
+        return target_path
+
+    def _ensure_workbook_for_month(self, month_text: str) -> Path:
+        path = self._find_workbook_for_month(month_text)
+        if path is not None:
+            return path
+        return self._create_workbook_for_month(month_text)
 
     def _find_maintenance_sheet(self, workbook: object) -> object:
         for sheet in workbook.worksheets:
@@ -1969,15 +2067,75 @@ class MaintenanceSearchApp:
                 break
         return max(last_row + 1, 5)
 
-    def _next_sequence_number(self, sheet: object) -> int:
-        numbers: list[int] = []
-        for row in range(5, sheet.max_row + 1):
-            value = sheet.cell(row, 1).value
-            try:
-                numbers.append(int(value))
-            except (TypeError, ValueError):
+    def _last_data_row(self, sheet: object) -> int:
+        for row in range(max(sheet.max_row, 5), 4, -1):
+            if any(safe_cell(sheet.cell(row, col).value) for col in range(1, 10)):
+                return row
+        return 4
+
+    @staticmethod
+    def _parse_month_day(value: object) -> Optional[tuple[int, int]]:
+        if isinstance(value, (datetime, date)):
+            return value.month, value.day
+        text = safe_cell(value)
+        if not text:
+            return None
+        match = re.search(r"(?:20\d{2})[.\-/년\s]+(\d{1,2})[.\-/월\s]+(\d{1,2})", text)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        match = re.search(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일?", text)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        match = re.search(r"(\d{1,2})[.\-/](\d{1,2})", text)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        return None
+
+    def _find_insert_row_for_date(self, sheet: object, date_text: str) -> tuple[int, bool]:
+        target = self._parse_month_day(date_text)
+        if target is None:
+            return self._find_next_insert_row(sheet), True
+
+        last_data_row = self._last_data_row(sheet)
+        if last_data_row < 5:
+            return 5, True
+
+        current_date: Optional[tuple[int, int]] = None
+        row = 5
+        while row <= last_data_row:
+            explicit_date = self._parse_month_day(sheet.cell(row, 2).value)
+            if explicit_date is None:
+                row += 1
                 continue
-        return max(numbers, default=0) + 1
+            if target < explicit_date:
+                return row, True
+            if target == explicit_date:
+                group_last_row = row
+                scan_row = row + 1
+                while scan_row <= last_data_row:
+                    if self._parse_month_day(sheet.cell(scan_row, 2).value) is not None:
+                        break
+                    if any(safe_cell(sheet.cell(scan_row, col).value) for col in range(1, 10)):
+                        group_last_row = scan_row
+                    scan_row += 1
+                return group_last_row + 1, False
+            current_date = explicit_date
+            row += 1
+
+        return last_data_row + 1, current_date != target
+
+    def _row_has_case_data(self, sheet: object, row: int) -> bool:
+        return any(safe_cell(sheet.cell(row, col).value) for col in range(2, 10))
+
+    def _renumber_sequences(self, sheet: object) -> None:
+        sequence = 1
+        for row in range(5, sheet.max_row + 1):
+            sequence_cell = sheet.cell(row, 1)
+            if self._row_has_case_data(sheet, row):
+                sequence_cell.value = sequence
+                sequence += 1
+            elif safe_cell(sequence_cell.value):
+                sequence_cell.value = None
 
     def _copy_row_style(self, sheet: object, source_row: int, target_row: int) -> None:
         if source_row < 5:
@@ -1997,10 +2155,12 @@ class MaintenanceSearchApp:
         sheet.row_dimensions[target_row].height = sheet.row_dimensions[source_row].height
 
     def _write_case_values(self, sheet: object, row: int, values: dict[str, str], sequence: Optional[int] = None) -> None:
-        if sequence is not None and not values.get("sequence"):
-            values["sequence"] = str(sequence)
+        if sequence is not None:
+            sheet.cell(row, 1).value = sequence
+        elif "sequence" in values:
+            value = values.get("sequence", "")
+            sheet.cell(row, 1).value = int(value) if value else None
         columns = {
-            1: "sequence",
             2: "date",
             3: "department",
             4: "user",
@@ -2012,22 +2172,27 @@ class MaintenanceSearchApp:
         }
         for col, key in columns.items():
             value = values.get(key, "")
-            if key == "sequence" and value:
-                sheet.cell(row, col).value = int(value)
-            else:
-                sheet.cell(row, col).value = value if value else None
+            sheet.cell(row, col).value = value if value else None
 
     def _save_new_case(self, month_text: str, values: dict[str, str]) -> tuple[Path, str]:
-        path = self._find_workbook_for_month(month_text)
-        if path is None:
-            raise RuntimeError(f"{month_text} 유지보수 엑셀 파일을 찾을 수 없습니다.")
+        path = self._ensure_workbook_for_month(month_text)
 
-        workbook = load_workbook(path)
+        workbook = load_workbook(path, keep_links=False)
         try:
             sheet = self._find_maintenance_sheet(workbook)
-            insert_row = self._find_next_insert_row(sheet)
-            self._copy_row_style(sheet, insert_row - 1, insert_row)
-            self._write_case_values(sheet, insert_row, values)
+            insert_row, should_write_date = self._find_insert_row_for_date(sheet, values.get("date", ""))
+            last_data_row = self._last_data_row(sheet)
+            if insert_row <= last_data_row:
+                sheet.insert_rows(insert_row)
+                style_source_row = insert_row + 1 if insert_row == 5 else insert_row - 1
+            else:
+                style_source_row = insert_row - 1
+            self._copy_row_style(sheet, style_source_row, insert_row)
+            write_values = values.copy()
+            if not should_write_date:
+                write_values["date"] = ""
+            self._write_case_values(sheet, insert_row, write_values)
+            self._renumber_sequences(sheet)
             workbook.save(path)
         finally:
             workbook.close()
@@ -2038,17 +2203,19 @@ class MaintenanceSearchApp:
         if path is None:
             raise RuntimeError(f"원본 파일을 찾을 수 없습니다: {case.source_file}")
 
-        workbook = load_workbook(path)
+        workbook = load_workbook(path, keep_links=False)
         try:
             if case.source_sheet not in workbook.sheetnames:
                 raise RuntimeError(f"원본 시트를 찾을 수 없습니다: {case.source_sheet}")
             sheet = workbook[case.source_sheet]
             self._write_case_values(sheet, case.row_num, values)
+            self._renumber_sequences(sheet)
+            updated_sequence = safe_cell(sheet.cell(case.row_num, 1).value)
             workbook.save(path)
         finally:
             workbook.close()
 
-        case.sequence_number = values["sequence"]
+        case.sequence_number = updated_sequence
         case.date_text = values["date"]
         case.department = values["department"]
         case.user = values["user"]
