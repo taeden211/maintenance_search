@@ -2299,6 +2299,16 @@ class MaintenanceSearchApp:
                 month_from = (start_year, month_from_value or 1)
                 month_to = (end_year, month_to_value or 12)
 
+        def parse_month(value: str) -> Optional[tuple[int, int]]:
+            value = value.strip()
+            if not value or value == "전체":
+                return None
+            try:
+                year_text, month_text = value.split("-", 1)
+                return int(year_text), int(month_text)
+            except ValueError:
+                return None
+
         return SearchFilters(
             year_from=year_from,
             year_to=year_to,
