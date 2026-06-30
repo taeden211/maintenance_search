@@ -15,7 +15,6 @@ dist/
 *.spec
 
 # Maintenance data and generated search indexes
-*.xlsx
 *.xls
 .maintenance_search_cache/
 *.sqlite
